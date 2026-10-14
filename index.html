@@ -250,7 +250,7 @@ function showLauncher(previous) {
   const el = document.createElement("div");
   el.className = "pane";
   el.innerHTML = `<div class="overlay" style="inset:0">
-      <div class="prompt">&gt;&gt;&gt; fork = sandbox.snapshot().restore()</div>
+      <div class="prompt">CreateSandboxSnapshot(sandbox_id) → CreateSandbox(snapshot_id)</div>
       <p></p><button>Launch sandbox</button></div>`;
   el.querySelector("p").textContent = previous ||
     "Get a gVisor-isolated Linux sandbox, make some state, then press Split. The sandbox is snapshotted and restored into a second one, side by side.";
