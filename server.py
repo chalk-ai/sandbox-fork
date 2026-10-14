@@ -3,9 +3,8 @@
 Each pane on the page is a WebSocket on `/ws` with its own sandbox: gVisor kernel, no network
 egress, half a CPU, a hard lifetime, and no credentials. Pressing "Split" on a pane snapshots
 that pane's running sandbox, restores the snapshot into a brand-new sandbox, and opens a second
-pane on the fork. Files, and `/tmp` (which lives in memory), come across exactly as they were.
-Running processes start fresh in the fork, so the shell's history and working directory are
-kept under `/tmp` on every prompt, and the forked shell picks them up from there.
+pane on the fork. The snapshot includes memory, so the fork gets the same files, the same `/tmp`,
+and the same live shell, with whatever was running in it: a Python REPL keeps its variables.
 
 Wire protocol on `/ws?cols=<n>&rows=<n>[&fork=<token>]`:
   client -> server  text {"type": "input", "data": "<keystrokes>"}
@@ -23,12 +22,14 @@ Wire protocol on `/ws?cols=<n>&rows=<n>[&fork=<token>]`:
 from __future__ import annotations
 
 import asyncio
+import base64
 import collections
 import ipaddress
 import json
 import logging
 import os
 import secrets
+import shlex
 import threading
 import time
 import uuid
@@ -69,48 +70,50 @@ SANDBOX_NAME_PREFIX = "web-fork-"
 SANDBOX_TAG = {"app": "web-fork-demo"}
 MAX_INPUT_BYTES = 16 * 1024
 
-# Visitor sandboxes run this image: Python plus a few tools that make forks easy to see.
-SANDBOX_IMAGE = Image.debian_slim(python_version="3.12").apt_install(["procps", "less", "tree"])
+# Visitor sandboxes run this image: Python, tmux (which holds each shell), and a few tools.
+SANDBOX_IMAGE = Image.debian_slim(python_version="3.12").apt_install(["tmux", "procps", "less", "tree"])
 
-# Shell state that must survive a fork goes under /tmp, which the snapshot restores from memory.
-SHELL_STATE_DIR = "/tmp/.shell"
+# After a restore, gVisor kills every process that was started through exec, because the caller
+# holding its stdio is gone; only the container's init and its descendants survive. So PID 1 is
+# this spawner, which runs each line written to SPAWN_FIFO as its own child. The shell lives in a
+# tmux server started that way, and a pane is only a tmux client, so a fork keeps the live shell.
+SPAWN_FIFO = "/run/spawn"
+SPAWNER = (
+    f"rm -f {SPAWN_FIFO}; mkfifo {SPAWN_FIFO}; while true; do while read -r cmd; do "
+    + f'setsid sh -c "$cmd" </dev/null >/dev/null 2>&1 & done < {SPAWN_FIFO}; done'
+)
+TMUX_SOCKET = "/run/tmux.sock"
+TMUX_CONF = "/run/tmux.conf"
+MOTD_FILE = "/run/motd"
+# A bare terminal: no status line, no prefix key, and no bindings, so every key reaches the shell.
+TMUX_CONFIG = (
+    "set -g status off\n"
+    + "set -g prefix None\n"
+    + "unbind-key -a\n"
+    + "set -g escape-time 0\n"
+    + "set -g history-limit 5000\n"
+    + "set -g default-terminal xterm-256color\n"
+    + "set -g window-size latest\n"
+)
 SHELL_ENV = {
-    "TERM": "xterm-256color",
     "HOME": "/workspace",
-    "HISTFILE": f"{SHELL_STATE_DIR}/history",
-    "HISTSIZE": "5000",
     "PS1": r"\[\e[38;5;150m\]sandbox\[\e[0m\]:\[\e[38;5;114m\]\w\[\e[0m\]$ ",
-    # Appends each command to HISTFILE and records the working directory before every prompt.
-    "PROMPT_COMMAND": f"history -a; pwd > {SHELL_STATE_DIR}/cwd",
 }
 
 MOTD = """
 \x1b[38;5;150m  chalk sandbox\x1b[0m  ·  gVisor kernel · no network · {minutes} minutes · yours alone
 
-  Make some state, then press \x1b[38;5;150mSplit\x1b[0m. The sandbox is snapshotted and restored
-  into a second sandbox with the same files and the same /tmp, side by side.
+  Start something, then press \x1b[38;5;150mSplit\x1b[0m. The whole sandbox, memory included, is
+  snapshotted and restored into a second one: same files, same shell, same running programs.
 
-  Try:  \x1b[38;5;114mecho "hello from pane 1" > notes.txt\x1b[0m
-        \x1b[38;5;114mpython3 -c "import random; print(random.random())" > /tmp/seed\x1b[0m
+  Try:  \x1b[38;5;114mpython3\x1b[0m, then  \x1b[38;5;114mx = 41\x1b[0m  and Split. Ask each pane for  \x1b[38;5;114mx + 1\x1b[0m.
 
 """
 MOTD_COMPACT = """
 \x1b[38;5;150m  chalk sandbox\x1b[0m
   gVisor kernel · no network
-  Make a file, then press \x1b[38;5;150mSplit\x1b[0m.
-
-"""
-FORK_BANNER = """
-\x1b[38;5;150m  fork of pane {parent}\x1b[0m  ·  snapshot {snapshot_ms} ms · restore {restore_ms} ms
-
-  Same files, same /tmp, same history (press ↑). A new sandbox: changes here
-  stay here. Running processes start fresh.
-
-"""
-FORK_BANNER_COMPACT = """
-\x1b[38;5;150m  fork of pane {parent}\x1b[0m
-  snapshot {snapshot_ms} ms · restore {restore_ms} ms
-  Same files and /tmp. Press ↑.
+  Run python3, set x = 41,
+  then press \x1b[38;5;150mSplit\x1b[0m.
 
 """
 MOTD_MIN_COLS = 76
@@ -204,6 +207,7 @@ def make_sandbox() -> Sandbox:
     # secrets: nothing inside the sandbox can call back into Chalk. A fork copies this spec.
     sandbox = Sandbox(
         image=SANDBOX_IMAGE,
+        entrypoint=["/bin/sh", "-c", SPAWNER],
         name=f"{SANDBOX_NAME_PREFIX}{uuid.uuid4().hex[:10]}",
         cpu=SANDBOX_CPU,
         memory=SANDBOX_MEMORY,
@@ -213,8 +217,8 @@ def make_sandbox() -> Sandbox:
         tags=SANDBOX_TAG,
     )
     sandbox.run()
-    # The shell starts in /workspace and keeps its fork-surviving state in SHELL_STATE_DIR.
-    sandbox.exec("mkdir", "-p", "/workspace", SHELL_STATE_DIR)
+    sandbox.exec("mkdir", "-p", "/workspace")
+    write_file(sandbox, TMUX_CONF, TMUX_CONFIG)
     return sandbox
 
 
@@ -223,6 +227,47 @@ def terminate_quietly(sandbox: Sandbox) -> None:
         sandbox.terminate()
     except Exception:
         log.exception("terminate failed for %s", sandbox.id)
+
+
+def write_file(sandbox: Sandbox, path: str, content: str) -> None:
+    encoded = base64.b64encode(content.encode()).decode()
+    sandbox.exec("sh", "-c", f"printf %s {encoded} | base64 -d > {path}")
+
+
+def start_shell(sandbox: Sandbox, cols: int, rows: int, motd: str) -> None:
+    """Has PID 1 start the tmux server that holds the visitor's shell, and waits for it."""
+    write_file(sandbox, MOTD_FILE, motd.replace("\n", "\r\n"))
+    shell_env = shlex.join(f"{key}={value}" for key, value in SHELL_ENV.items())
+    shell = f"cat {MOTD_FILE}; exec env {shell_env} bash --norc --noprofile -i"
+    command = (
+        f"tmux -f {TMUX_CONF} -S {TMUX_SOCKET} new-session -d -s main -x {cols} -y {rows} "
+        + f"-c /workspace {shlex.quote(shell)}"
+    )
+    # The command reaches PID 1 as one line of the FIFO; it contains no newlines.
+    result = sandbox.exec(
+        "sh",
+        "-c",
+        # printf rather than echo: dash's echo would interpret the prompt's backslashes.
+        f"printf '%s\\n' {shlex.quote(command)} > {SPAWN_FIFO}; "
+        + f"for i in $(seq 100); do tmux -S {TMUX_SOCKET} has-session -t main 2>/dev/null && exit 0; sleep 0.05; done; exit 1",
+    )
+    if result.exit_code != 0:
+        raise RuntimeError("the shell did not start")
+
+
+def attach_tmux(sandbox: Sandbox, cols: int, rows: int) -> ContainerSession:
+    """Opens a PTY session running a tmux client on the sandbox's shell."""
+    return state["sessions"].new_session(
+        sandbox.id,
+        "tmux",
+        "-S",
+        TMUX_SOCKET,
+        "attach-session",
+        "-t",
+        "main",
+        env={"TERM": "xterm-256color"},
+        pty=(cols, rows),
+    )
 
 
 def reap_orphans() -> None:
@@ -488,8 +533,10 @@ async def root_pane(websocket: WebSocket) -> None:
         pool: WarmPool = state["pool"]
         sandbox = await pool.take()
         cols = clamp_dim(websocket.query_params.get("cols"), 20, 300, 100)
-        banner = MOTD if cols >= MOTD_MIN_COLS else MOTD_COMPACT
-        await run_pane(websocket, sandbox, group, 1, banner.format(minutes=SESSION_SECONDS // 60), "/workspace")
+        rows = clamp_dim(websocket.query_params.get("rows"), 5, 120, 30)
+        motd = (MOTD if cols >= MOTD_MIN_COLS else MOTD_COMPACT).format(minutes=SESSION_SECONDS // 60)
+        await asyncio.to_thread(start_shell, sandbox, cols, rows, motd)
+        await run_pane(websocket, sandbox, group, 1, None)
     finally:
         state["sandboxes"] -= 1
         if group.open_panes == 0:
@@ -506,12 +553,9 @@ async def fork_pane(websocket: WebSocket, token: str) -> None:
         await websocket.close()
         return
     try:
-        # The fork's shell starts where the parent's shell was, as recorded on its last prompt.
-        cwd = (await asyncio.to_thread(fork.sandbox.exec, "cat", f"{SHELL_STATE_DIR}/cwd")).stdout.decode().strip()
-        cols = clamp_dim(websocket.query_params.get("cols"), 20, 300, 100)
-        banner = FORK_BANNER if cols >= MOTD_MIN_COLS else FORK_BANNER_COMPACT
-        text = banner.format(parent=fork.parent_pane, snapshot_ms=fork.snapshot_ms, restore_ms=fork.restore_ms)
-        await run_pane(websocket, fork.sandbox, fork.group, fork.pane, text, cwd or "/workspace")
+        # The restored tmux server still holds the parent's shell; attaching shows it as it was.
+        note = f"fork of pane {fork.parent_pane} · snapshot {fork.snapshot_ms} ms · restore {fork.restore_ms} ms"
+        await run_pane(websocket, fork.sandbox, fork.group, fork.pane, note)
     finally:
         fork.group.panes -= 1
         state["sandboxes"] -= 1
@@ -520,29 +564,21 @@ async def fork_pane(websocket: WebSocket, token: str) -> None:
         await asyncio.to_thread(terminate_quietly, fork.sandbox)
 
 
-async def run_pane(websocket: WebSocket, sandbox: Sandbox, group: Group, pane: int, banner: str, cwd: str) -> None:
+async def run_pane(websocket: WebSocket, sandbox: Sandbox, group: Group, pane: int, note: str | None) -> None:
+    """Attaches the browser to the sandbox's tmux session, showing `note` briefly if given."""
     session: ContainerSession | None = None
     group.open_panes += 1
     try:
         cols = clamp_dim(websocket.query_params.get("cols"), 20, 300, 100)
         rows = clamp_dim(websocket.query_params.get("rows"), 5, 120, 30)
-        # The banner is display-only, so it goes straight to the browser rather than through
-        # the shell, where its quotes would need escaping.
-        await websocket.send_bytes(banner.replace("\n", "\r\n").encode())
-        session = await asyncio.to_thread(
-            state["sessions"].new_session,
-            sandbox.id,
-            "/bin/bash",
-            "--norc",
-            "--noprofile",
-            "-i",
-            workdir=cwd,
-            env=SHELL_ENV,
-            pty=(cols, rows),
-        )
+        session = await asyncio.to_thread(attach_tmux, sandbox, cols, rows)
+        if note is not None:
+            await asyncio.to_thread(
+                sandbox.exec, "tmux", "-S", TMUX_SOCKET, "display-message", "-d", "5000", "-t", "main", note
+            )
         remaining = max(1, int(group.deadline - time.monotonic()))
         await send(websocket, {"type": "ready", "expires_in": remaining, "sandbox": short_id(sandbox), "pane": pane})
-        reason = await proxy(websocket, session, sandbox, group, pane)
+        reason = await proxy(websocket, session, sandbox, group, pane, [cols, rows])
         await send(websocket, {"type": "ended", "reason": reason})
         await websocket.close()
     except WebSocketDisconnect:
@@ -558,18 +594,20 @@ async def run_pane(websocket: WebSocket, sandbox: Sandbox, group: Group, pane: i
         group.open_panes -= 1
 
 
-async def split(websocket: WebSocket, sandbox: Sandbox, group: Group, pane: int) -> None:
-    """Forks `sandbox` and tells the browser how to open a pane on the fork."""
+def split_refusal(group: Group) -> str | None:
+    """Returns why a split is not allowed right now, or None after reserving a start for it."""
     if group.panes >= MAX_PANES:
-        await send(websocket, {"type": "split_failed", "message": f"Up to {MAX_PANES} panes per visitor."})
-        return
+        return f"Up to {MAX_PANES} panes per visitor."
     if state["sandboxes"] >= MAX_SANDBOXES:
-        await send(websocket, {"type": "split_failed", "message": "Every demo sandbox is in use right now."})
-        return
-    refusal = state["limiter"].acquire_global()
-    if refusal is not None:
-        await send(websocket, {"type": "split_failed", "message": refusal})
-        return
+        return "Every demo sandbox is in use right now."
+    return state["limiter"].acquire_global()
+
+
+async def split(websocket: WebSocket, sandbox: Sandbox, group: Group, pane: int) -> None:
+    """Forks `sandbox` and tells the browser how to open a pane on the fork.
+
+    The caller has already detached every tmux client from the sandbox (see `proxy`).
+    """
     group.panes += 1
     state["sandboxes"] += 1
     try:
@@ -591,27 +629,37 @@ async def split(websocket: WebSocket, sandbox: Sandbox, group: Group, pane: int)
     )
 
 
-async def proxy(websocket: WebSocket, session: ContainerSession, sandbox: Sandbox, group: Group, pane: int) -> str:
-    """Pumps PTY output to the browser and keystrokes to the PTY; returns why it stopped."""
+async def proxy(
+    websocket: WebSocket, session: ContainerSession, sandbox: Sandbox, group: Group, pane: int, size: list[int]
+) -> str:
+    """Pumps PTY output to the browser and keystrokes to the PTY; returns why it stopped.
+
+    A split swaps the pane's tmux client for a fresh one, so the session in use can change.
+    Every event is tagged with the generation of the session that produced it, and events from
+    a retired session, including its exit, are ignored.
+    """
     loop = asyncio.get_running_loop()
     events: asyncio.Queue[Any] = asyncio.Queue()
     last_input = time.monotonic()
     splitting = False
+    attached = {"session": session, "gen": 0}
 
-    # The SDK's event stream is a blocking iterator, so it gets its own thread.
-    def read_events() -> None:
+    # The SDK's event stream is a blocking iterator, so each session gets its own thread.
+    def read_events(sess: ContainerSession, gen: int) -> None:
         try:
-            for event in session.events():
-                loop.call_soon_threadsafe(events.put_nowait, event)
+            for event in sess.events():
+                loop.call_soon_threadsafe(events.put_nowait, (gen, event))
         except Exception as e:
-            loop.call_soon_threadsafe(events.put_nowait, e)
-        loop.call_soon_threadsafe(events.put_nowait, None)
+            loop.call_soon_threadsafe(events.put_nowait, (gen, e))
+        loop.call_soon_threadsafe(events.put_nowait, (gen, None))
 
-    threading.Thread(target=read_events, daemon=True).start()
+    threading.Thread(target=read_events, args=(session, 0), daemon=True).start()
 
     async def pump_output() -> str:
         while True:
-            event = await events.get()
+            gen, event = await events.get()
+            if gen != attached["gen"]:
+                continue
             if event is None or isinstance(event, Exception):
                 return "exited"
             if isinstance(event, ContainerSession.OutputEvent):
@@ -630,7 +678,21 @@ async def proxy(websocket: WebSocket, session: ContainerSession, sandbox: Sandbo
     async def run_split() -> None:
         nonlocal splitting
         try:
-            await split(websocket, sandbox, group, pane)
+            refusal = split_refusal(group)
+            if refusal is not None:
+                await send(websocket, {"type": "split_failed", "message": refusal})
+                return
+            # A tmux client hands its terminal, a host-backed PTY, to the tmux server. A
+            # surviving process that holds a host fd cannot be restored, so the snapshot is taken
+            # with no client attached, and the pane gets a fresh client afterwards.
+            attached["gen"] += 1
+            await asyncio.to_thread(sandbox.exec, "tmux", "-S", TMUX_SOCKET, "detach-client", "-s", "main")
+            try:
+                await split(websocket, sandbox, group, pane)
+            finally:
+                fresh = await asyncio.to_thread(attach_tmux, sandbox, size[0], size[1])
+                attached["session"] = fresh
+                threading.Thread(target=read_events, args=(fresh, attached["gen"]), daemon=True).start()
         finally:
             splitting = False
 
@@ -647,13 +709,16 @@ async def proxy(websocket: WebSocket, session: ContainerSession, sandbox: Sandbo
             kind = ctrl.get("type")
             if kind == "input" and isinstance(ctrl.get("data"), str):
                 last_input = time.monotonic()
-                await asyncio.to_thread(session.write, ctrl["data"].encode())
+                # Keystrokes typed while the pane is detached for a split are dropped.
+                if not splitting:
+                    await asyncio.to_thread(attached["session"].write, ctrl["data"].encode())
             elif kind == "resize":
-                cols = clamp_dim(ctrl.get("cols"), 20, 300, 100)
-                rows = clamp_dim(ctrl.get("rows"), 5, 120, 30)
-                await asyncio.to_thread(session.resize, cols, rows)
+                size[0] = clamp_dim(ctrl.get("cols"), 20, 300, 100)
+                size[1] = clamp_dim(ctrl.get("rows"), 5, 120, 30)
+                if not splitting:
+                    await asyncio.to_thread(attached["session"].resize, size[0], size[1])
             elif kind == "split" and not splitting:
-                # The split runs beside the pumps so the pane stays interactive meanwhile.
+                # The split runs beside the pumps so the pane keeps receiving output meanwhile.
                 splitting = True
                 last_input = time.monotonic()
                 asyncio.create_task(run_split())

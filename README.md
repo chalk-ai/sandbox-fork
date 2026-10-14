@@ -14,27 +14,41 @@ browser (ghostty-web) ──WebSocket──▶ server.py ──PTY session──
 
 ## What a fork keeps
 
-A fork is restored from a checkpoint of the whole sandbox, so it starts with:
+A fork is restored from a checkpoint of the whole sandbox, memory included, so it starts with:
 
 - **Files:** everything in the file system, exactly as it was at the snapshot.
 - **`/tmp`:** it lives in memory, and it comes across too.
-- **Your shell's place:** the shell records its working directory and history under `/tmp` on
-  every prompt, so the forked shell opens in the same directory with the same history behind the
-  up arrow.
+- **The live shell:** the same shell, the same scrollback, and whatever was running in it. A Python
+  REPL in the middle of a session keeps its variables and even its process ID.
 - **The same isolation:** the fork's spec is the source's: kernel policy, network policy, CPU,
   memory, and lifetime.
 
-Running processes start fresh in the fork: the new pane gets a new shell.
+From the moment it is created, each fork is independent of its source. Change a file or a
+variable in one pane and the others never see it.
 
-Each fork is independent of its source from the moment it is created. Change a file in one pane
-and the others never see it.
+## Which processes survive a fork
+
+After a restore, gVisor kills every process that was started through `exec`, along with all of
+its descendants, because the caller holding its stdin and stdout is gone. That includes
+background jobs, `setsid` and `nohup` daemons, and tmux servers started from an exec session.
+Only the container's init process (PID 1) and its descendants survive.
+
+So this demo makes PID 1 a tiny spawner (`SPAWNER` in `server.py`). It reads commands from a FIFO
+and runs each one as its own child. The visitor's shell lives in a tmux server started that way,
+and every pane is just a tmux client attached over a PTY session. In a fork, the client is gone,
+but the tmux server and everything under it survive, and a new client attaches to them.
+
+One more rule: a surviving process must not hold a file descriptor from the host. A tmux client
+passes its terminal, which is a host PTY, to the tmux server, so the server would hold a host
+descriptor. Split therefore detaches the pane's client for the second it takes to snapshot, then
+attaches a fresh one.
 
 ## Files
 
 | File | Role |
 | --- | --- |
 | `deploy.py` | Builds the server image (with ghostty-web fetched from npm) and deploys it as a `chalkcompute.ScalingGroup`. |
-| `server.py` | FastAPI app: `GET /` serves the page, `WS /ws` hands out a sandbox, relays its PTY, and forks it on request. |
+| `server.py` | FastAPI app: `GET /` serves the page, `WS /ws` hands out a sandbox, relays its tmux session over a PTY, and forks it on request. |
 | `index.html` | The split-terminal page. Add `?embed=1` to drop the title when you put it in an iframe. |
 
 ## Run it

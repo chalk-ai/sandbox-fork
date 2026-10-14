@@ -71,7 +71,7 @@
 <body>
   <header>
     <h1>Chalk sandbox fork</h1>
-    <p>Split a live terminal: the sandbox is snapshotted and restored into a second sandbox. Rendered with ghostty-web.</p>
+    <p>Split a live terminal: the sandbox, running programs and all, is snapshotted and restored into a second sandbox. Rendered with ghostty-web.</p>
   </header>
   <div class="frame">
     <div class="topbar">
@@ -253,7 +253,7 @@ function showLauncher(previous) {
       <div class="prompt">CreateSandboxSnapshot(sandbox_id) → CreateSandbox(snapshot_id)</div>
       <p></p><button>Launch sandbox</button></div>`;
   el.querySelector("p").textContent = previous ||
-    "Get a gVisor-isolated Linux sandbox, make some state, then press Split. The sandbox is snapshotted and restored into a second one, side by side.";
+    "Get a gVisor-isolated Linux sandbox, start something (a Python REPL, a loop), then press Split. The whole sandbox, running programs included, is snapshotted and restored into a second one, side by side.";
   el.querySelector("button").addEventListener("click", () => {
     panesEl.replaceChildren();
     toast("snapshot · restore · split");
