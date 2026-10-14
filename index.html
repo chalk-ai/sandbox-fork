@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chalk Sandbox Fork</title>
+<style>
+  /* Chalk marketing palette: green-1 ground, chartreuse primary, mint accents. */
+  :root { --bg:#224A41; --term:#173029; --line:#32645B; --ink:#EFF5F3; --muted:#B9CFC7;
+          --accent:#BBD96D; --mint:#70CD96; --warn:#F8947F;
+          --mono: ui-monospace,"SFMono-Regular",Menlo,Monaco,monospace; }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+         display:flex; flex-direction:column; padding:24px; gap:12px; }
+  html.embed body { padding:0; gap:0; }
+  html.embed header { display:none; }
+  header h1 { font-size:22px; font-weight:500; margin:0; letter-spacing:-0.3px; }
+  header p { margin:4px 0 0; color:var(--muted); font-size:14px; }
+  .frame { position:relative; flex:1; min-height:360px; display:flex; flex-direction:column;
+           border:1px solid var(--line); border-radius:4px; overflow:hidden; background:var(--term); }
+  html.embed .frame { border:0; border-radius:0; }
+  .topbar { display:flex; align-items:center; justify-content:space-between; gap:12px;
+            padding:8px 14px; background:var(--bg); border-bottom:1px solid var(--line);
+            font:12px/18px var(--mono); text-transform:uppercase; letter-spacing:.06em; color:var(--muted); }
+  #timer { color:var(--accent); }
+  #toast { color:var(--mint); text-transform:none; letter-spacing:0; overflow:hidden; text-overflow:ellipsis;
+           white-space:nowrap; }
+  #toast.warn { color:var(--warn); }
+  /* Panes tile two across; on phones they stack. */
+  #panes { flex:1; min-height:0; display:grid; gap:1px; background:var(--line);
+           grid-template-columns:1fr; grid-auto-rows:minmax(0,1fr); }
+  #panes.n2, #panes.n3, #panes.n4 { grid-template-columns:1fr 1fr; }
+  #panes.n3 .pane:first-child { grid-row:span 2; }
+  @media (max-width: 700px) {
+    #panes.n2, #panes.n3, #panes.n4 { grid-template-columns:1fr; }
+    #panes.n3 .pane:first-child { grid-row:auto; }
+  }
+  .pane { position:relative; display:flex; flex-direction:column; min-height:0; min-width:0; background:var(--term); }
+  .pane.new { animation:appear .45s ease-out; }
+  @keyframes appear { from { opacity:0; transform:scale(.985); } to { opacity:1; transform:none; } }
+  .pbar { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 8px 6px 12px;
+          border-bottom:1px solid var(--line); font:11px/16px var(--mono); text-transform:uppercase;
+          letter-spacing:.06em; color:var(--muted); background:rgba(34,74,65,.6); }
+  .pbar .title { display:flex; align-items:center; gap:8px; min-width:0; white-space:nowrap; overflow:hidden; }
+  .pbar .lineage { color:var(--mint); }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--line); flex:none; }
+  .dot.live { background:var(--mint); box-shadow:0 0 0 3px rgba(112,205,150,.2); }
+  .term { flex:1; padding:8px 10px; min-height:0; }
+  button { font:13px/15px var(--mono); text-transform:uppercase; letter-spacing:.06em;
+           border:1px solid var(--accent); border-radius:20px; padding:12px 22px; cursor:pointer;
+           background:var(--accent); color:var(--bg); transition:background .15s,color .15s; }
+  button:hover { background:transparent; color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  button.split { padding:5px 12px; font-size:11px; line-height:14px; display:flex; align-items:center; gap:6px; flex:none; }
+  button.split svg { width:12px; height:12px; }
+  .overlay { position:absolute; inset:29px 0 0 0; display:flex; flex-direction:column; align-items:center;
+             justify-content:center; gap:16px; padding:24px; text-align:center; background:var(--term); }
+  .overlay[hidden] { display:none; }
+  .overlay p { margin:0; max-width:480px; color:var(--muted); font-size:15px; }
+  .overlay .prompt { font:14px/20px var(--mono); color:var(--mint); }
+  .spinner { width:18px; height:18px; border:2px solid var(--line); border-top-color:var(--accent);
+             border-radius:50%; animation:spin .8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+</style>
+<script>
+  if (new URLSearchParams(location.search).has("embed")) document.documentElement.classList.add("embed");
+</script>
+</head>
+<body>
+  <header>
+    <h1>Chalk sandbox fork</h1>
+    <p>Split a live terminal: the sandbox is snapshotted and restored into a second sandbox. Rendered with ghostty-web.</p>
+  </header>
+  <div class="frame">
+    <div class="topbar">
+      <span id="toast">snapshot · restore · split</span>
+      <span id="timer"></span>
+    </div>
+    <div id="panes"></div>
+  </div>
+
+<template id="pane-template">
+  <div class="pane">
+    <div class="pbar">
+      <span class="title"><span class="dot"></span><span class="label">pane 1</span><span class="lineage"></span></span>
+      <button class="split" title="Snapshot this sandbox and open a fork beside it" disabled>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="2.5" width="13" height="11" rx="1"/><path d="M8 2.5v11"/></svg>
+        Split
+      </button>
+    </div>
+    <div class="term"></div>
+    <div class="overlay" hidden><div class="spinner"></div><p class="otext"></p></div>
+  </div>
+</template>
+
+<script type="module">
+import { init, Terminal, FitAddon } from "./static/ghostty-web.js";
+
+const panesEl = document.getElementById("panes");
+const toastEl = document.getElementById("toast");
+const timerEl = document.getElementById("timer");
+const template = document.getElementById("pane-template");
+const THEME = {
+  background: "#173029", foreground: "#EFF5F3", cursor: "#BBD96D", cursorAccent: "#173029",
+  selectionBackground: "#32645B",
+  black: "#0C3129", red: "#F8947F", green: "#70CD96", yellow: "#F3F662",
+  blue: "#81CEEA", magenta: "#B29AF9", cyan: "#73D19C", white: "#EFF5F3",
+  brightBlack: "#648680", brightRed: "#F57596", brightGreen: "#BBD96D", brightYellow: "#F3F662",
+  brightBlue: "#C2FAFC", brightMagenta: "#B5A3FC", brightCyan: "#C0EAD4", brightWhite: "#FFFFFF",
+};
+const ENDED_TEXT = {
+  exited: "The shell exited, and this sandbox has been deleted.",
+  idle: "This sandbox was idle for a while, so it has been deleted.",
+  time_limit: "Time's up. Demo sandboxes last a few minutes, then they are deleted.",
+  fork_expired: "That fork expired before it opened.",
+  error: "Something went wrong with this sandbox.",
+};
+const MAX_PANES = 4;
+
+await init();
+
+const panes = [];
+// Exposed for browser tests, which read terminal buffers since ghostty draws to a canvas.
+window.panes = panes;
+let countdown = null;
+
+function toast(text, warn = false) {
+  toastEl.textContent = text;
+  toastEl.classList.toggle("warn", warn);
+}
+
+function layout() {
+  panesEl.className = `n${panesEl.children.length}`;
+  requestAnimationFrame(() => panes.forEach((p) => p.fit.fit()));
+  const canSplit = panes.length < MAX_PANES;
+  panes.forEach((p) => { p.splitBtn.disabled = !(p.live && canSplit && !p.splitting); });
+}
+
+function startCountdown(seconds) {
+  if (countdown) return;
+  const end = Date.now() + seconds * 1000;
+  const tick = () => {
+    const left = Math.max(0, Math.round((end - Date.now()) / 1000));
+    timerEl.textContent = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")} left`;
+  };
+  tick();
+  countdown = setInterval(tick, 1000);
+}
+
+function wsUrl(term, fork) {
+  const url = new URL("ws", location.href);
+  url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  url.searchParams.set("cols", term.cols);
+  url.searchParams.set("rows", term.rows);
+  if (fork) url.searchParams.set("fork", fork);
+  return url;
+}
+
+// Creates a pane and connects it: a fresh sandbox when `fork` is null, else the fork it names.
+function addPane({ fork = null, parent = null, pane = 1, focus = true } = {}) {
+  const el = template.content.firstElementChild.cloneNode(true);
+  if (parent) el.classList.add("new");
+  panesEl.appendChild(el);
+  const p = {
+    el, ws: null, live: false, splitting: false, pane,
+    label: el.querySelector(".label"), lineage: el.querySelector(".lineage"),
+    dot: el.querySelector(".dot"), splitBtn: el.querySelector(".split"),
+    overlay: el.querySelector(".overlay"), otext: el.querySelector(".otext"),
+    term: new Terminal({ cursorBlink: true, fontSize: 13, scrollback: 5000, theme: THEME,
+                         fontFamily: 'ui-monospace, "SFMono-Regular", Menlo, Monaco, monospace' }),
+    fit: new FitAddon(),
+  };
+  p.label.textContent = `pane ${pane}`;
+  if (parent) p.lineage.textContent = `· fork of ${parent}`;
+  p.term.loadAddon(p.fit);
+  p.term.open(el.querySelector(".term"));
+  p.fit.observeResize();
+  panes.push(p);
+  layout();
+  p.fit.fit();
+  p.overlay.hidden = false;
+  p.otext.textContent = fork ? "Attaching to the restored sandbox…" : "Starting a fresh sandbox…";
+
+  p.term.onData((data) => p.ws?.readyState === WebSocket.OPEN && p.ws.send(JSON.stringify({ type: "input", data })));
+  p.term.onResize(({ cols, rows }) => p.ws?.readyState === WebSocket.OPEN && p.ws.send(JSON.stringify({ type: "resize", cols, rows })));
+  p.splitBtn.addEventListener("click", () => {
+    if (!p.live || p.splitting) return;
+    p.splitting = true;
+    layout();
+    toast(`Snapshotting pane ${p.pane}…`);
+    p.ws.send(JSON.stringify({ type: "split" }));
+  });
+
+  const ws = new WebSocket(wsUrl(p.term, fork));
+  ws.binaryType = "arraybuffer";
+  p.ws = ws;
+  let ended = null;
+  ws.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) { p.term.write(new Uint8Array(ev.data)); return; }
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "status") {
+      p.otext.textContent = msg.message;
+    } else if (msg.type === "ready") {
+      p.overlay.hidden = true;
+      p.live = true;
+      p.dot.classList.add("live");
+      p.label.textContent = `pane ${msg.pane} · ${msg.sandbox}`;
+      startCountdown(msg.expires_in);
+      layout();
+      if (focus) p.term.focus();
+    } else if (msg.type === "forked") {
+      p.splitting = false;
+      toast(`Forked pane ${p.pane} → pane ${msg.pane}: snapshot ${msg.snapshot_ms} ms · restore ${msg.restore_ms} ms`);
+      addPane({ fork: msg.token, parent: p.pane, pane: msg.pane });
+    } else if (msg.type === "split_failed") {
+      p.splitting = false;
+      toast(msg.message, true);
+      layout();
+    } else if (msg.type === "busy" || msg.type === "limited") {
+      ended = msg.message;
+    } else if (msg.type === "ended") {
+      ended = ENDED_TEXT[msg.reason] || ENDED_TEXT.exited;
+    }
+  };
+  ws.onclose = () => {
+    p.ws = null;
+    p.live = false;
+    p.dot.classList.remove("live");
+    p.overlay.querySelector(".spinner")?.remove();
+    p.otext.textContent = ended || "The connection closed, and this sandbox has been deleted.";
+    p.overlay.hidden = false;
+    layout();
+    if (panes.every((q) => !q.live && !q.ws)) {
+      clearInterval(countdown);
+      countdown = null;
+      timerEl.textContent = "";
+      showLauncher(ended);
+    }
+  };
+  return p;
+}
+
+// The empty state: one launch button. Nothing connects until the visitor asks, so an embedding
+// page does not start sandboxes on load.
+function showLauncher(previous) {
+  panes.splice(0).forEach((p) => p.term.dispose?.());
+  panesEl.replaceChildren();
+  const el = document.createElement("div");
+  el.className = "pane";
+  el.innerHTML = `<div class="overlay" style="inset:0">
+      <div class="prompt">&gt;&gt;&gt; fork = sandbox.snapshot().restore()</div>
+      <p></p><button>Launch sandbox</button></div>`;
+  el.querySelector("p").textContent = previous ||
+    "Get a gVisor-isolated Linux sandbox, make some state, then press Split. The sandbox is snapshotted and restored into a second one, side by side.";
+  el.querySelector("button").addEventListener("click", () => {
+    panesEl.replaceChildren();
+    toast("snapshot · restore · split");
+    addPane();
+  });
+  panesEl.appendChild(el);
+  panesEl.className = "n1";
+}
+
+showLauncher(null);
+</script>
+</body>
+</html>
