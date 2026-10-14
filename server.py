@@ -36,7 +36,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
 from chalkcompute import ComputeClass, ContainerSecurityPolicy, ContainerSession, Image, KernelPolicy, Sandbox
@@ -323,34 +323,21 @@ class SnapshotClient:
             log.exception("deleting snapshot %s failed", snapshot_id)
 
 
-def fork_sandbox(snapshots: SnapshotClient, source: Sandbox) -> tuple[Sandbox, int, int]:
-    """Snapshots `source` (which keeps running) and boots a new sandbox from it.
-
-    Returns the fork and how long the snapshot and the restore took, in milliseconds.
-    """
-    t0 = time.monotonic()
-    snapshot_id = snapshots.snapshot(source.id)
-    t1 = time.monotonic()
-    fork: Sandbox | None = None
+def boot_fork(snapshots: SnapshotClient, snapshot_id: str) -> Sandbox:
+    """Boots a new sandbox from `snapshot_id` and waits until it is running."""
+    fork = Sandbox.from_id(snapshots.fork(snapshot_id))
+    deadline = time.monotonic() + FORK_READY_TIMEOUT_SECONDS
     try:
-        fork = Sandbox.from_id(snapshots.fork(snapshot_id))
-        deadline = t1 + FORK_READY_TIMEOUT_SECONDS
         while True:
             status = fork.refresh().status
             if status == "running":
-                break
+                return fork
             if status in ("failed", "terminated", "stopped") or time.monotonic() > deadline:
                 raise RuntimeError(f"fork did not start (status {status})")
-            time.sleep(0.2)
-        t2 = time.monotonic()
-        return fork, round((t1 - t0) * 1000), round((t2 - t1) * 1000)
+            time.sleep(0.1)
     except Exception:
-        if fork is not None:
-            terminate_quietly(fork)
+        terminate_quietly(fork)
         raise
-    finally:
-        # A running fork no longer needs the snapshot it booted from.
-        snapshots.delete(snapshot_id)
 
 
 class WarmPool:
@@ -536,7 +523,7 @@ async def root_pane(websocket: WebSocket) -> None:
         rows = clamp_dim(websocket.query_params.get("rows"), 5, 120, 30)
         motd = (MOTD if cols >= MOTD_MIN_COLS else MOTD_COMPACT).format(minutes=SESSION_SECONDS // 60)
         await asyncio.to_thread(start_shell, sandbox, cols, rows, motd)
-        await run_pane(websocket, sandbox, group, 1, None)
+        await run_pane(websocket, sandbox, group, 1)
     finally:
         state["sandboxes"] -= 1
         if group.open_panes == 0:
@@ -554,8 +541,7 @@ async def fork_pane(websocket: WebSocket, token: str) -> None:
         return
     try:
         # The restored tmux server still holds the parent's shell; attaching shows it as it was.
-        note = f"fork of pane {fork.parent_pane} · snapshot {fork.snapshot_ms} ms · restore {fork.restore_ms} ms"
-        await run_pane(websocket, fork.sandbox, fork.group, fork.pane, note)
+        await run_pane(websocket, fork.sandbox, fork.group, fork.pane)
     finally:
         fork.group.panes -= 1
         state["sandboxes"] -= 1
@@ -564,18 +550,14 @@ async def fork_pane(websocket: WebSocket, token: str) -> None:
         await asyncio.to_thread(terminate_quietly, fork.sandbox)
 
 
-async def run_pane(websocket: WebSocket, sandbox: Sandbox, group: Group, pane: int, note: str | None) -> None:
-    """Attaches the browser to the sandbox's tmux session, showing `note` briefly if given."""
+async def run_pane(websocket: WebSocket, sandbox: Sandbox, group: Group, pane: int) -> None:
+    """Attaches the browser to the sandbox's tmux session."""
     session: ContainerSession | None = None
     group.open_panes += 1
     try:
         cols = clamp_dim(websocket.query_params.get("cols"), 20, 300, 100)
         rows = clamp_dim(websocket.query_params.get("rows"), 5, 120, 30)
         session = await asyncio.to_thread(attach_tmux, sandbox, cols, rows)
-        if note is not None:
-            await asyncio.to_thread(
-                sandbox.exec, "tmux", "-S", TMUX_SOCKET, "display-message", "-d", "5000", "-t", "main", note
-            )
         remaining = max(1, int(group.deadline - time.monotonic()))
         await send(websocket, {"type": "ready", "expires_in": remaining, "sandbox": short_id(sandbox), "pane": pane})
         reason = await proxy(websocket, session, sandbox, group, pane, [cols, rows])
@@ -603,21 +585,36 @@ def split_refusal(group: Group) -> str | None:
     return state["limiter"].acquire_global()
 
 
-async def split(websocket: WebSocket, sandbox: Sandbox, group: Group, pane: int) -> None:
+async def split(
+    websocket: WebSocket, sandbox: Sandbox, group: Group, pane: int, reattach: Callable[[], Awaitable[None]]
+) -> None:
     """Forks `sandbox` and tells the browser how to open a pane on the fork.
 
-    The caller has already detached every tmux client from the sandbox (see `proxy`).
+    The caller has already detached every tmux client from the sandbox (see `proxy`); once the
+    snapshot exists, `reattach` gives the source pane its client back while the fork boots.
     """
+    snapshots: SnapshotClient = state["snapshots"]
     group.panes += 1
     state["sandboxes"] += 1
+    snapshot_id: str | None = None
     try:
-        fork, snapshot_ms, restore_ms = await asyncio.to_thread(fork_sandbox, state["snapshots"], sandbox)
+        t0 = time.monotonic()
+        snapshot_id = await asyncio.to_thread(snapshots.snapshot, sandbox.id)
+        t1 = time.monotonic()
+        fork, _ = await asyncio.gather(asyncio.to_thread(boot_fork, snapshots, snapshot_id), reattach())
+        t2 = time.monotonic()
     except Exception:
         group.panes -= 1
         state["sandboxes"] -= 1
         log.exception("split of %s failed", sandbox.id)
         await send(websocket, {"type": "split_failed", "message": "That split didn't work. Try again."})
         return
+    finally:
+        # A running fork no longer needs its snapshot. Deleting it takes a second or two, so it
+        # happens off the visitor's critical path.
+        if snapshot_id is not None:
+            asyncio.create_task(asyncio.to_thread(snapshots.delete, snapshot_id))
+    snapshot_ms, restore_ms = round((t1 - t0) * 1000), round((t2 - t1) * 1000)
     token = secrets.token_urlsafe(16)
     child_pane = group.next_pane
     group.next_pane += 1
@@ -687,12 +684,22 @@ async def proxy(
             # with no client attached, and the pane gets a fresh client afterwards.
             attached["gen"] += 1
             await asyncio.to_thread(sandbox.exec, "tmux", "-S", TMUX_SOCKET, "detach-client", "-s", "main")
-            try:
-                await split(websocket, sandbox, group, pane)
-            finally:
+            reattached = False
+
+            async def reattach() -> None:
+                nonlocal reattached, splitting
+                if reattached:
+                    return
+                reattached = True
                 fresh = await asyncio.to_thread(attach_tmux, sandbox, size[0], size[1])
                 attached["session"] = fresh
                 threading.Thread(target=read_events, args=(fresh, attached["gen"]), daemon=True).start()
+                splitting = False
+
+            try:
+                await split(websocket, sandbox, group, pane, reattach)
+            finally:
+                await reattach()
         finally:
             splitting = False
 
