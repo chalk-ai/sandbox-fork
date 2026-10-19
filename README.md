@@ -55,8 +55,7 @@ attaches a fresh one.
 
 You need [`uv`](https://docs.astral.sh/uv/) and a Chalk environment with sandboxes and sandbox
 snapshots enabled. Snapshots need host-backed sandboxes (`ComputeClass.HOST`). Credentials come
-from the SDK’s ambient credentials from `chalk login`. You can also set `CHALK_API_SERVER`,
-`CHALK_CLIENT_ID`, `CHALK_CLIENT_SECRET` and `CHALK_ENVIRONMENT_ID` yourself.
+from your existing `chalk login`.
 
 ```bash
 ./deploy.py
@@ -149,3 +148,7 @@ The SDK reads credentials, API host, and the selected environment from your exis
 `chalk login` in `~/.chalk.yml`, including project-scoped and default logins.
 For unattended runs, `CHALK_CLIENT_ID` and `CHALK_CLIENT_SECRET` remain supported.
 The examples use the current environment selected by your Chalk login.
+
+Requires `chalkcompute>=2.13.8` with the public connection context and in-memory
+secret APIs from [chalk-sandbox-sdk#511](https://github.com/chalk-ai/chalk-sandbox-sdk/pull/511).
+This PR is waiting for that SDK release.
