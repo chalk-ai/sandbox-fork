@@ -55,7 +55,7 @@ attaches a fresh one.
 
 You need [`uv`](https://docs.astral.sh/uv/) and a Chalk environment with sandboxes and sandbox
 snapshots enabled. Snapshots need host-backed sandboxes (`ComputeClass.HOST`). Credentials come
-from `chalk config` in the current directory. You can also set `CHALK_API_SERVER`,
+from the SDK’s ambient credentials from `chalk login`. You can also set `CHALK_API_SERVER`,
 `CHALK_CLIENT_ID`, `CHALK_CLIENT_SECRET` and `CHALK_ENVIRONMENT_ID` yourself.
 
 ```bash
@@ -142,3 +142,10 @@ Pooled sandboxes and forks expire on their own lifetime within about 16 minutes.
 ## License
 
 Apache-2.0. ghostty-web is MIT.
+
+## Local authentication
+
+The SDK reads credentials, API host, and the selected environment from your existing
+`chalk login` in `~/.chalk.yml`, including project-scoped and default logins.
+For unattended runs, `CHALK_CLIENT_ID` and `CHALK_CLIENT_SECRET` remain supported. Where available, `--env-id`
+overrides the target environment; otherwise the SDK uses your login or environment settings.
